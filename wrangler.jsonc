@@ -3,6 +3,8 @@
   "name": "wxdc",
   "main": "worker/index.ts",
   "compatibility_date": "2026-11-13",
+  "workers_dev": false,
+  "preview_urls": false,
   "assets": {
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
@@ -12,12 +14,28 @@
     {
       "binding": "DB",
       "database_name": "wxdc",
-      "database_id": "00000000-0000-0000-0000-000000000000",
       "migrations_dir": "migrations",
+      "database_id": "00000000-0000-0000-0000-000000000000",
     },
   ],
-  "durable_objects": { "bindings": [{ "name": "COORDINATOR", "class_name": "Coordinator" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Coordinator"] }],
-  "triggers": { "crons": ["0 0,10 * * *"] },
-  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "COORDINATOR",
+        "class_name": "Coordinator",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Coordinator"],
+    },
+  ],
+  "triggers": {
+    "crons": ["0 0,10 * * *"],
+  },
+  "observability": {
+    "enabled": true,
+  },
 }

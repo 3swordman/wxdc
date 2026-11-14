@@ -1,4 +1,4 @@
-import { Canteen, active, type Detail, type OrderHistoryBudget } from './canteen';
+import { Canteen, active, type Detail, type RequestBudget } from './canteen';
 import { categorizeMenu } from './categories';
 import {
   MEALS,
@@ -145,84 +145,131 @@ function reservationContext(records: Detail[]): RecentDish[] {
   });
 }
 
+class InvalidDeepSeekResponse extends Error {}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 async function chooseMenus(
   env: Env,
   days: OrderDay[],
   requirements: string,
   recentDishes: RecentDish[],
-  timeout = 120_000,
+  {
+    timeout = 120_000,
+    budget,
+    requireSelection = false,
+  }: {
+    timeout?: number;
+    budget?: RequestBudget;
+    requireSelection?: boolean;
+  } = {},
 ) {
   if (!env.DEEPSEEK_API_KEY) throw new Error('DeepSeek API key is not configured');
+  const dishes = new Map<number, { date: string; meal: Meal; dish: Dish }>();
   const reduced = days.map((day) => ({
     date: day.date,
     menu: Object.fromEntries(
       MEALS.map((m) => [
         m,
-        day.menu[m].map((d, i) => ({
-          id: i,
-          name: d.name,
-          price: Number(d.price),
-          category: d.categoryName ?? null,
-        })),
+        day.menu[m].map((dish) => {
+          const id = dishes.size + 1;
+          dishes.set(id, { date: day.date, meal: m, dish });
+          return {
+            id,
+            name: dish.name,
+            price: Number(dish.price),
+            category: dish.categoryName ?? null,
+          };
+        }),
       ]),
     ),
     recentMeals: recentDishes.filter(
       ({ date }) => date < day.date && date >= addDays(day.date, -reservationLookbackDays),
     ),
   }));
-  const prompt = `Choose canteen meals following the user's requirements. Use each dish's category and the recentMeals list as context for variety. In recentMeals, reserved means an active reservation, submitted means sent during this run and awaiting confirmation, and draft means a choice saved for review. Choose only dishes from the corresponding date and meal's menu. Return only JSON as an object keyed by date, with breakfastorders, lunchorders, supperorders arrays. Each item must contain the exact numeric id, name and price from the corresponding menu. Empty menus must have empty arrays. Example JSON: {"2026-01-01":{"breakfastorders":[],"lunchorders":[],"supperorders":[]}}. Requirements: ${requirements}\nMenus: ${JSON.stringify(reduced)}`;
-  const response = await fetch('https://api.deepseek.com/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${env.DEEPSEEK_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'deepseek-flash',
-      messages: [{ role: 'user', content: prompt }],
-      response_format: { type: 'json_object' },
-      thinking: { type: 'disabled' },
-    }),
-    signal: AbortSignal.timeout(timeout),
-  });
-  const body: any = await response.json();
-  if (!response.ok) throw new Error(`DeepSeek: ${body?.error?.message || response.status}`);
-  let chosen: any;
-  try {
-    chosen = JSON.parse(body?.choices?.[0]?.message?.content);
-  } catch {
-    throw new Error('DeepSeek returned invalid or empty JSON');
-  }
-  if (!chosen || typeof chosen !== 'object' || Array.isArray(chosen))
-    throw new Error('DeepSeek returned an invalid order');
-  for (let i = 0; i < days.length; i++) {
-    const day = days[i];
-    const result = emptyMeals();
-    for (const meal of MEALS) {
-      const selected = chosen[day.date]?.[meal] || [];
-      if (!Array.isArray(selected) || selected.length > 100)
-        throw new Error(`DeepSeek returned an invalid ${meal} list`);
-      for (const item of selected) {
-        const idx = item?.id;
-        const offered = reduced[i].menu[meal][idx];
-        if (
-          !Number.isInteger(idx) ||
-          !offered ||
-          offered.name !== item.name ||
-          offered.price !== Number(item.price)
-        )
-          throw new Error(`DeepSeek selected an invalid dish on ${day.date}`);
-        result[meal].push(day.menu[meal][idx]);
-      }
+  const prompt = [
+    "Choose canteen meals following the user's requirements. Use each dish's category and the recentMeals list as context for variety.",
+    'In recentMeals, reserved means an active reservation, submitted means sent during this run and awaiting confirmation, and draft means a choice saved for review.',
+    "Return one JSON object keyed by the dates in Menus, with breakfastorders, lunchorders, and supperorders arrays of numeric IDs only. Copy each ID from that date and meal's menu.",
+    'Use [] when no dish is selected. Repeated IDs indicate multiple portions.',
+    'Example format with placeholder dates and IDs: {"2026-01-01":{"breakfastorders":[],"lunchorders":[4,7],"supperorders":[]}}.',
+    `Requirements: ${requirements}`,
+    `Menus: ${JSON.stringify(reduced)}`,
+  ].join('\n');
+  const signal = AbortSignal.timeout(timeout);
+  const requestPicks = async (correction = '') => {
+    const response = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.DEEPSEEK_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'deepseek-flash',
+        messages: [{ role: 'user', content: correction + prompt }],
+        response_format: { type: 'json_object' },
+        thinking: { type: 'disabled' },
+      }),
+      signal,
+    });
+    const body: any = await response.json();
+    if (!response.ok) throw new Error(`DeepSeek: ${body?.error?.message || response.status}`);
+    let chosen: unknown;
+    try {
+      chosen = JSON.parse(body?.choices?.[0]?.message?.content);
+    } catch {
+      throw new InvalidDeepSeekResponse('DeepSeek returned invalid or empty JSON');
     }
-    day.auto_order = result;
+    if (!isObject(chosen) || Object.keys(chosen).length !== days.length)
+      throw new InvalidDeepSeekResponse('DeepSeek returned an invalid order');
+    return days.map(({ date }) => {
+      const picks = chosen[date];
+      if (!isObject(picks) || Object.keys(picks).some((key) => !MEALS.some((meal) => meal === key)))
+        throw new InvalidDeepSeekResponse(`DeepSeek returned an invalid order for ${date}`);
+      const selection = emptyMeals();
+      for (const meal of MEALS) {
+        const ids = picks[meal] === undefined ? [] : picks[meal];
+        if (!Array.isArray(ids) || ids.length > 100)
+          throw new InvalidDeepSeekResponse(
+            `DeepSeek returned an invalid ${meal} list for ${date}`,
+          );
+        for (const item of ids) {
+          const id = typeof item === 'string' && /^\d+$/.test(item) ? Number(item) : item;
+          const offered = typeof id === 'number' ? dishes.get(id) : undefined;
+          if (offered?.date !== date || offered.meal !== meal)
+            throw new InvalidDeepSeekResponse(
+              `DeepSeek selected an invalid dish ID for ${date} ${meal}`,
+            );
+          selection[meal].push(offered.dish);
+        }
+      }
+      if (requireSelection && !hasDishes(selection))
+        throw new InvalidDeepSeekResponse(`DeepSeek returned no dishes for ${date}`);
+      return selection;
+    });
+  };
+
+  let selections: MealMap[];
+  try {
+    selections = await requestPicks();
+  } catch (error) {
+    if (!(error instanceof InvalidDeepSeekResponse) || signal.aborted || budget?.remaining === 0)
+      throw error;
+    if (budget) budget.remaining--;
+    selections = await requestPicks(
+      `The previous response could not be used. ${error.message}. Copy only numeric dish IDs from the correct date and meal.\n`,
+    );
   }
+  days.forEach((day, i) => (day.auto_order = selections[i]));
 }
 
 export async function generate(
   env: Env,
   week: 'current' | 'next',
   getCategories?: (client: Canteen) => Promise<FoodCategory[]>,
+  client = new Canteen(env),
 ): Promise<{ week: string; days: OrderDay[] }> {
   const settings = await getSettings(env.DB);
   const { monday, selections } = mealSchedule(settings, week);
@@ -235,7 +282,6 @@ export async function generate(
   const selected = selections.filter((day) => day.meals);
   if (!selected.length) throw new Error('请先配置本周或下周的订餐日期');
   const allMenus: Record<string, MealMap> = {};
-  const client = new Canteen(env);
   const recentDishes = await client.session(async (c) => {
     const categories = getCategories ? await getCategories(c) : [];
     for (const x of selections) allMenus[x.date] = categorizeMenu(await c.menu(x.date), categories);
@@ -267,6 +313,7 @@ export async function runAIOrder(
   submit: boolean,
   getCategories: (client: Canteen) => Promise<FoodCategory[]>,
   scheduledTime?: number,
+  canteen = new Canteen(env),
 ): Promise<AIOrderResult> {
   const result: AIOrderResult = {
     ordered: [],
@@ -295,13 +342,13 @@ export async function runAIOrder(
   if (!remaining.length) return result;
 
   const timeLimit = scheduledTime === undefined ? Infinity : Date.now() + 13 * 60_000;
-  await new Canteen(env).session(async (client) => {
-    // Reserve requests for binding, categories, two history lookups, and each date.
-    const historyBudget = { extraPages: 50 - 6 - remaining.length * (submit ? 3 : 2) };
+  await canteen.session(async (client) => {
+    // Reserve requests for OAuth and one refresh/retry, categories, two history lookups, and each date.
+    const budget = { remaining: 50 - 6 - remaining.length * (submit ? 3 : 2) };
     const records = await client.details(
       addDays(remaining[0].date, -reservationLookbackDays),
       remaining[remaining.length - 1].date,
-      historyBudget,
+      budget,
     );
     const recentDishes = reservationContext(records);
     const candidates = await findUnorderedDates(env.DB, records, remaining, result);
@@ -337,8 +384,11 @@ export async function runAIOrder(
           continue;
         }
         const day: OrderDay = { date, menu, auto_order: emptyMeals() };
-        await chooseMenus(env, [day], settings.requirements, recentDishes, 35_000);
-        if (!hasDishes(day.auto_order)) throw new Error('DeepSeek 未选择菜品');
+        await chooseMenus(env, [day], settings.requirements, recentDishes, {
+          timeout: 35_000,
+          budget,
+          requireSelection: true,
+        });
         const entries = orderEntries(day);
         if (submit) {
           attempted.push(day);
@@ -364,7 +414,7 @@ export async function runAIOrder(
       }
     }
     if (attempted.length) {
-      await confirmAIOrders(env.DB, client, attempted, result, historyBudget);
+      await confirmAIOrders(env.DB, client, attempted, result, budget);
     }
   });
   return result;
@@ -394,12 +444,12 @@ async function confirmAIOrders(
   client: Canteen,
   days: OrderDay[],
   result: AIOrderResult,
-  historyBudget: OrderHistoryBudget,
+  budget: RequestBudget,
 ) {
   try {
-    const records = (
-      await client.details(days[0].date, days[days.length - 1].date, historyBudget)
-    ).filter(active);
+    const records = (await client.details(days[0].date, days[days.length - 1].date, budget)).filter(
+      active,
+    );
     const orderedDates = new Set(records.map((record) => record.ORDERDATE));
     await rememberOrderedDays(
       db,
@@ -441,7 +491,12 @@ function count(records: Detail[]) {
 }
 type DesiredDay = Pick<OrderDay, 'date' | 'auto_order'>;
 
-export async function applyDays(env: Env, desiredDays: DesiredDay[], cancelExtras: boolean) {
+export async function applyDays(
+  env: Env,
+  desiredDays: DesiredDay[],
+  cancelExtras: boolean,
+  client = new Canteen(env),
+) {
   if (!Array.isArray(desiredDays) || !desiredDays.length || desiredDays.length > 31)
     throw new Error('No valid days');
   for (const day of desiredDays) if (!isDate(day.date)) throw new Error('Invalid date');
@@ -449,7 +504,7 @@ export async function applyDays(env: Env, desiredDays: DesiredDay[], cancelExtra
   const failures: string[] = [],
     cancelled: string[] = [],
     ordered: string[] = [];
-  return new Canteen(env).session(async (c) => {
+  return client.session(async (c) => {
     const before = await c.details(dates[0], dates[dates.length - 1]);
     const initial = count(before);
     const entries: { date: string; meal: number; dish: Dish }[] = [];

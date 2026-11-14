@@ -90,6 +90,11 @@ function validateDays(days: OrderDay[]) {
 
 export class Coordinator extends DurableObject<Env> {
   private queue = new SerialQueue();
+
+  private canteen() {
+    return new Canteen(this.env, this.ctx.storage);
+  }
+
   private async foodCategories(client?: Canteen): Promise<FoodCategory[]> {
     const cached = await this.ctx.storage.get<{ categories: FoodCategory[]; expiresAt: number }>(
       'foodCategories',
@@ -98,7 +103,7 @@ export class Coordinator extends DurableObject<Env> {
     try {
       const categories = client
         ? await client.foodCategories()
-        : await new Canteen(this.env).session((canteen) => canteen.foodCategories());
+        : await this.canteen().session((canteen) => canteen.foodCategories());
       if (!categories.length) throw new Error('Canteen returned no food categories');
       await this.ctx.storage.put('foodCategories', {
         categories,
@@ -107,7 +112,7 @@ export class Coordinator extends DurableObject<Env> {
       return categories;
     } catch (e) {
       console.warn('Food categories unavailable:', e);
-      // Avoid repeated binding attempts if credentials or the service are unavailable.
+      // Avoid repeated category requests when the session or service is unavailable.
       const categories = cached?.categories ?? [];
       await this.ctx.storage.put('foodCategories', {
         categories,
@@ -130,6 +135,7 @@ export class Coordinator extends DurableObject<Env> {
         !scheduled || settings.autoSubmit,
         (client) => this.foodCategories(client),
         scheduledTime,
+        this.canteen(),
       );
       const summary = `AI 订餐：提交 ${result.ordered.length} 天，已有订单 ${result.existing.length} 天，待提交 ${result.drafted.length} 天，未供餐 ${result.unavailable.length} 天`;
       await job(
@@ -190,6 +196,10 @@ export class Coordinator extends DurableObject<Env> {
       }
       if (!(await authenticated(req, this.env))) return error('请先登录', 401);
       if (path === '/api/session' && req.method === 'GET') return json({ success: true });
+      if (path === '/api/balance' && req.method === 'GET') {
+        const balance = await this.canteen().session((client) => client.balance());
+        return json({ balance });
+      }
       if (path === '/api/logout' && req.method === 'POST')
         return json({ success: true }, 200, {
           'Set-Cookie': 'wxdc_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0',
@@ -223,8 +233,11 @@ export class Coordinator extends DurableObject<Env> {
         const body: { week: string } = await req.json();
         if (!['current', 'next'].includes(body.week)) return error('Invalid week');
         try {
-          const result = await generate(this.env, body.week as 'current' | 'next', (c) =>
-            this.foodCategories(c),
+          const result = await generate(
+            this.env,
+            body.week as 'current' | 'next',
+            (c) => this.foodCategories(c),
+            this.canteen(),
           );
           await job(this.env.DB, 'manual', 'success', `Generated ${result.week}`);
           return json(result);
@@ -271,7 +284,12 @@ export class Coordinator extends DurableObject<Env> {
         if (action === 'submit' && req.method === 'POST') {
           const pending = await getPending(this.env.DB, week);
           validateDays(pending);
-          const { confirmedDates, ...result } = await applyDays(this.env, pending, false);
+          const { confirmedDates, ...result } = await applyDays(
+            this.env,
+            pending,
+            false,
+            this.canteen(),
+          );
           await rememberOrderedDays(this.env.DB, confirmedDates);
           if (result.success)
             await this.env.DB.prepare('DELETE FROM pending_orders WHERE week_start=?')
@@ -288,7 +306,7 @@ export class Coordinator extends DurableObject<Env> {
         if (action === 'status' && req.method === 'GET') {
           const pending = await getPending(this.env.DB, week);
           const dates = pending.map((d) => d.date).sort();
-          const records = await new Canteen(this.env).session((c) =>
+          const records = await this.canteen().session((c) =>
             c.details(dates[0], dates[dates.length - 1]),
           );
           return json(
@@ -301,7 +319,7 @@ export class Coordinator extends DurableObject<Env> {
       if (path === '/api/live' && req.method === 'GET') {
         const date = url.searchParams.get('date');
         if (!isDate(date)) return error('Invalid date');
-        const result = await new Canteen(this.env).session(async (c) => {
+        const result = await this.canteen().session(async (c) => {
           const menu = await c.menu(date);
           const categories = await this.foodCategories(c);
           return {
@@ -313,7 +331,12 @@ export class Coordinator extends DurableObject<Env> {
       }
       if (path === '/api/live' && req.method === 'POST') {
         const body: { date: string; auto_order: OrderDay['auto_order'] } = await req.json();
-        const { confirmedDates, ...result } = await applyDays(this.env, [body], true);
+        const { confirmedDates, ...result } = await applyDays(
+          this.env,
+          [body],
+          true,
+          this.canteen(),
+        );
         await rememberOrderedDays(this.env.DB, confirmedDates);
         await job(
           this.env.DB,
@@ -333,7 +356,7 @@ export class Coordinator extends DurableObject<Env> {
           (Date.parse(end) - Date.parse(start)) / 86400_000 > 30
         )
           return error('Invalid date range');
-        const result = await new Canteen(this.env).session(async (c) => ({
+        const result = await this.canteen().session(async (c) => ({
           booked: await c.booked(start, end),
           details: (await c.details(start, end)).filter(active),
         }));

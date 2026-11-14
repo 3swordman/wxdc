@@ -5,7 +5,6 @@ export interface Env {
   APP_PASSWORD: string;
   SESSION_SECRET: string;
   CANTEEN_USER_NO: string;
-  CANTEEN_PASSWORD: string;
   WECHAT_OPEN_ID: string;
   WECHAT_JSESSIONID: string;
   WECHAT_CENTER_ID?: string;
@@ -62,6 +61,11 @@ export function addDays(date: string, days: number): string {
   const d = new Date(`${date}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
+}
+export function bookedMealsRange(today = nowShanghai()) {
+  const day = new Date(`${today}T00:00:00Z`).getUTCDay();
+  const start = addDays(today, -((day + 6) % 7));
+  return { start, end: addDays(start, 20) };
 }
 export function mondayFor(week: 'current' | 'next', today = nowShanghai()): string {
   const day = new Date(`${today}T00:00:00Z`).getUTCDay();

@@ -1,7 +1,6 @@
 APP_PASSWORD="replace-with-a-unique-app-password"
 SESSION_SECRET="replace-with-at-least-32-random-characters"
 CANTEEN_USER_NO="your-student-number"
-CANTEEN_PASSWORD="your-canteen-password"
 WECHAT_OPEN_ID="your-wechat-openid"
 WECHAT_JSESSIONID="your-jsessionid"
 WECHAT_CENTER_ID="9053"

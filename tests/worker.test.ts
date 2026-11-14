@@ -1,54 +1,139 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
-import { createCipheriv } from 'node:crypto';
-import { Canteen, encryptedCredentials } from '../worker/canteen';
+import { Canteen } from '../worker/canteen';
 import { categorizeMenu, groupDishesByCategory } from '../worker/categories';
 import { cleanSettings, validateSelection } from '../worker/engine';
-import { addDays, defaults, emptyMeals, mondayFor, type Env } from '../worker/types';
+import {
+  addDays,
+  bookedMealsRange,
+  defaults,
+  emptyMeals,
+  mondayFor,
+  nowShanghai,
+  type Env,
+} from '../worker/types';
 
 const env = {
   CANTEEN_USER_NO: '1234567',
-  CANTEEN_PASSWORD: 'example',
   WECHAT_OPEN_ID: 'openid',
   WECHAT_JSESSIONID: 'session',
   WECHAT_CENTER_ID: '9053',
 } as Env;
 afterEach(() => vi.restoreAllMocks());
-describe('canteen binding', () => {
-  it('encrypts credentials compatibly with AES-CBC and PKCS7', async () => {
-    const cipher = createCipheriv(
-      'aes-128-cbc',
-      Buffer.from('7Fpu9FSkjayCeqaE'),
-      Buffer.from('0123456789ABCDEF'),
-    );
-    const expected = Buffer.concat([
-      cipher.update(JSON.stringify({ userno: '1234567', pwd: 'example' })),
-      cipher.final(),
-    ]).toString('base64');
-    expect(await encryptedCredentials('1234567', 'example')).toBe(expected);
-  });
-  it('stops immediately on a locked account instead of continuing to oauth', async () => {
+describe('canteen session', () => {
+  function sessionStorage() {
+    const entries = new Map<string, unknown>();
+    return {
+      get: async (key: string) => entries.get(key),
+      put: async (key: string, value: unknown) => void entries.set(key, value),
+      delete: async (key: string) => entries.delete(key),
+    } as Pick<DurableObjectStorage, 'get' | 'put' | 'delete'>;
+  }
+
+  it('reports an OAuth failure without running the operation', async () => {
     const mock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(JSON.stringify({ success: false, code: 500, message: '账号被锁定' }), {
         status: 200,
       }),
     );
-    await expect(new Canteen(env).session(async () => true)).rejects.toThrow('账号被锁定');
+    const operation = vi.fn();
+    await expect(new Canteen(env).session(operation)).rejects.toThrow('账号被锁定');
     expect(mock).toHaveBeenCalledTimes(1);
+    expect(operation).not.toHaveBeenCalled();
   });
-  it('binds, authenticates, runs, and unbinds in order', async () => {
+
+  it('reuses OAuth across clients and retries a read with the refreshed identity', async () => {
+    const storage = sessionStorage();
+    let authorizations = 0;
+    let expired = false;
+    const profiles: string[] = [];
+    const mock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/wechat/oauth') {
+        expect(url.searchParams.get('openId')).toBe('openid');
+        const id = ++authorizations;
+        return Response.json({
+          success: true,
+          result: { token: `token-${id}`, centerId: 9053, empId: `employee-${id}`, empType: 1 },
+        });
+      }
+      expect(url.pathname).toBe('/api/wechat/getUserInfo');
+      const token = new Headers(init?.headers).get('X-Access-Token');
+      profiles.push(`${token}:${url.searchParams.get('empId')}`);
+      if (expired && token === 'token-1') return Response.json({ success: false, code: '401' });
+      return Response.json({ success: true, result: { eaccountvalue: '24.50' } });
+    });
+    const balance = (config = env) => new Canteen(config, storage).session((c) => c.balance());
+    expect(await balance()).toBe(24.5);
+    expect(await balance()).toBe(24.5);
+    expect(authorizations).toBe(1);
+    expired = true;
+    expect(await balance()).toBe(24.5);
+    expect(await balance()).toBe(24.5);
+    expect(await balance({ ...env, WECHAT_JSESSIONID: 'new-cookie' })).toBe(24.5);
+    expect(authorizations).toBe(3);
+    expect(profiles).toEqual([
+      'token-1:employee-1',
+      'token-1:employee-1',
+      'token-1:employee-1',
+      'token-2:employee-2',
+      'token-2:employee-2',
+      'token-3:employee-3',
+    ]);
+    expect(mock.mock.calls.some(([input]) => /\/(?:toBind|unBind)$/.test(String(input)))).toBe(
+      false,
+    );
+  });
+
+  it('invalidates an expired token without replaying an order', async () => {
+    const storage = sessionStorage();
     const mock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
       const path = new URL(String(input)).pathname;
-      return Response.json(
-        path.endsWith('/oauth')
-          ? { success: true, result: { token: 'token', centerId: 9053 } }
-          : { success: true, result: {} },
-      );
+      if (path.endsWith('/oauth'))
+        return Response.json({ success: true, result: { token: 'token' } });
+      return new Response(null, { status: 401 });
     });
-    expect(await new Canteen(env).session(async () => 42)).toBe(42);
-    expect(mock.mock.calls.map((c) => new URL(String(c[0])).pathname)).toEqual([
-      '/api/wechat/toBind',
+    await expect(
+      new Canteen(env, storage).session((c) =>
+        c.order([{ date: '2026-11-16', meal: 1, dish: { id: 10, name: 'rice', price: 2 } }]),
+      ),
+    ).rejects.toThrow('订餐登录已失效');
+    expect(mock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
       '/api/wechat/oauth',
-      '/api/wechat/unBind',
+      '/api/orderdata/setOrder',
+    ]);
+    expect(await storage.get('canteenSession')).toBeUndefined();
+  });
+});
+
+describe('canteen balance', () => {
+  it.each([
+    ['24.50', 24.5],
+    [0, 0],
+    ['', undefined],
+  ])('reads the account balance %j using the OAuth account identity', async (value, expected) => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/oauth')) {
+        return Response.json({
+          success: true,
+          result: { token: 'token', centerId: 9053, empId: 'account-id', empType: 1 },
+        });
+      }
+      if (url.pathname.endsWith('/getUserInfo')) {
+        expect(url.searchParams.get('empId')).toBe('account-id');
+        expect(url.searchParams.get('empType')).toBe('1');
+        expect(init?.method).toBe('POST');
+        expect(new Headers(init?.headers).get('X-Access-Token')).toBe('token');
+        return Response.json({ success: true, result: { eaccountvalue: value } });
+      }
+      return Response.json({ success: true });
+    });
+    const balance = new Canteen(env).session((client) => client.balance());
+    if (expected === undefined) await expect(balance).rejects.toThrow('未返回有效余额');
+    else await expect(balance).resolves.toBe(expected);
+    expect(fetch.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
+      '/api/wechat/oauth',
+      '/api/wechat/getUserInfo',
     ]);
   });
 });
@@ -72,6 +157,16 @@ describe('order safety', () => {
     expect(mondayFor('current', '2026-11-13')).toBe('2026-11-16');
     expect(mondayFor('next', '2026-11-15')).toBe('2026-11-23');
     expect(mondayFor('current', '2026-11-16')).toBe('2026-11-23');
+  });
+  it('shows three full calendar weeks starting with this Monday in Beijing time', () => {
+    expect(bookedMealsRange(nowShanghai(Date.parse('2026-12-27T15:59:59Z')))).toEqual({
+      start: '2026-12-21',
+      end: '2027-01-10',
+    });
+    expect(bookedMealsRange(nowShanghai(Date.parse('2026-12-27T16:00:00Z')))).toEqual({
+      start: '2026-12-28',
+      end: '2027-01-17',
+    });
   });
 });
 
@@ -100,7 +195,7 @@ describe('food categories', () => {
       String(call[0]).includes('getOrderFoodType'),
     );
     expect(categoryRequest?.[1]?.method).toBe('GET');
-    expect(mock.mock.calls.filter((call) => String(call[0]).includes('/toBind'))).toHaveLength(1);
+    expect(mock.mock.calls.filter((call) => String(call[0]).includes('/oauth'))).toHaveLength(1);
   });
 
   it('groups dishes by their actual category without changing selection IDs or duplicating items', () => {
@@ -264,7 +359,7 @@ describe('DeepSeek generation', () => {
             date: monday,
             menu: {
               ...emptyMeals(),
-              lunchorders: [{ id: 0, name: 'rice', price: 2, category: '菜品' }],
+              lunchorders: [{ id: 1, name: 'rice', price: 2, category: '菜品' }],
             },
             recentMeals: [
               {
@@ -282,7 +377,7 @@ describe('DeepSeek generation', () => {
             {
               message: {
                 content: JSON.stringify({
-                  [monday]: { lunchorders: [{ id: 0, name: 'rice', price: 2 }] },
+                  [monday]: { lunchorders: ['1'] },
                 }),
               },
             },
@@ -349,18 +444,25 @@ describe('DeepSeek generation', () => {
     const monday = '2026-11-16';
     const tuesday = '2026-11-17';
     const prompts: { date: string; recentMeals: unknown[] }[] = [];
+    let retryPrompt = '';
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const url = new URL(String(input));
       if (url.hostname === 'api.deepseek.com') {
         const prompt = JSON.parse(String(init?.body)).messages[0].content as string;
         const [day] = JSON.parse(prompt.split('\nMenus: ')[1]);
-        prompts.push(day);
+        const retrying = prompt.startsWith('The previous response could not be used');
+        if (retrying) retryPrompt = prompt;
+        else prompts.push(day);
+        const picks =
+          day.date === monday && !retrying
+            ? { supperorders: [day.menu.lunchorders[0].id] }
+            : { lunchorders: [day.menu.lunchorders[0].id] };
         return Response.json({
           choices: [
             {
               message: {
                 content: JSON.stringify({
-                  [day.date]: { lunchorders: [{ id: 0, name: 'rice', price: 2 }] },
+                  [day.date]: picks,
                 }),
               },
             },
@@ -386,6 +488,8 @@ describe('DeepSeek generation', () => {
       Date.parse('2026-11-15T00:00:00Z'),
     );
     expect(result.drafted).toEqual([monday, tuesday]);
+    expect(result.failures).toEqual([]);
+    expect(retryPrompt).toContain(`invalid dish ID for ${monday} supperorders`);
     expect(prompts.map(({ date, recentMeals }) => ({ date, recentMeals }))).toEqual([
       { date: monday, recentMeals: [] },
       {
@@ -395,37 +499,49 @@ describe('DeepSeek generation', () => {
     ]);
   });
 
-  it('rejects invalid JSON without writing an order', async () => {
-    const { generate } = await import('../worker/engine');
-    const writes = vi.fn();
-    const db = {
-      prepare: (sql: string) => ({
-        bind() {
-          return this;
-        },
-        first: async () =>
-          sql.startsWith('SELECT value FROM settings')
-            ? { value: JSON.stringify({ ...defaults(), days: { '1': 'l' } }) }
-            : null,
-        run: async () => writes(),
-      }),
-    };
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
-      const u = new URL(String(input));
-      if (u.hostname === 'api.deepseek.com')
-        return Response.json({ choices: [{ message: { content: 'not json' } }] });
-      if (u.pathname.endsWith('/oauth'))
-        return Response.json({ success: true, result: { token: 'token', centerId: '9053' } });
-      if (u.pathname.endsWith('/getOrderFoodList'))
-        return Response.json({
-          success: true,
-          result: { ...emptyMeals(), lunchorders: [{ id: '1', name: 'rice', price: 2 }] },
-        });
-      return Response.json({ success: true, result: {} });
-    });
-    await expect(
-      generate({ ...env, DB: db as unknown as D1Database, DEEPSEEK_API_KEY: 'test' }, 'current'),
-    ).rejects.toThrow('invalid or empty JSON');
-    expect(writes).not.toHaveBeenCalled();
-  });
+  it.each(['invalid JSON', 'an unknown dish ID'])(
+    'rejects %s twice without writing an order',
+    async (invalid) => {
+      const { generate } = await import('../worker/engine');
+      const writes = vi.fn();
+      const db = {
+        prepare: (sql: string) => ({
+          bind() {
+            return this;
+          },
+          first: async () =>
+            sql.startsWith('SELECT value FROM settings')
+              ? { value: JSON.stringify({ ...defaults(), days: { '1': 'l' } }) }
+              : null,
+          run: async () => writes(),
+        }),
+      };
+      let requests = 0;
+      const monday = mondayFor('current');
+      const response =
+        invalid === 'invalid JSON'
+          ? 'not json'
+          : JSON.stringify({ [monday]: { lunchorders: [999] } });
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+        const u = new URL(String(input));
+        if (u.hostname === 'api.deepseek.com') {
+          requests++;
+          return Response.json({ choices: [{ message: { content: response } }] });
+        }
+        if (u.pathname.endsWith('/oauth'))
+          return Response.json({ success: true, result: { token: 'token', centerId: '9053' } });
+        if (u.pathname.endsWith('/getOrderFoodList'))
+          return Response.json({
+            success: true,
+            result: { ...emptyMeals(), lunchorders: [{ id: '1', name: 'rice', price: 2 }] },
+          });
+        return Response.json({ success: true, result: {} });
+      });
+      await expect(
+        generate({ ...env, DB: db as unknown as D1Database, DEEPSEEK_API_KEY: 'test' }, 'current'),
+      ).rejects.toThrow(invalid === 'invalid JSON' ? 'invalid or empty JSON' : 'invalid dish ID');
+      expect(requests).toBe(2);
+      expect(writes).not.toHaveBeenCalled();
+    },
+  );
 });

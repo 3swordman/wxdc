@@ -13,43 +13,60 @@ export type Detail = {
   ORDERAMOUNT?: string;
 };
 export const active = (r: Detail) => !['3', '4'].includes(String(r.ORDERSTATUS));
-export interface OrderHistoryBudget {
-  extraPages: number;
+export interface RequestBudget {
+  remaining: number;
 }
 
-export async function encryptedCredentials(user: string, password: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    'raw',
-    encoder.encode('7Fpu9FSkjayCeqaE'),
-    'AES-CBC',
-    false,
-    ['encrypt'],
-  );
-  const plaintext = encoder.encode(JSON.stringify({ userno: user, pwd: password }));
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: 'AES-CBC', iv: encoder.encode('0123456789ABCDEF') },
-    key,
-    plaintext,
-  );
-  return btoa(String.fromCharCode(...new Uint8Array(ciphertext)));
+interface CanteenSession {
+  token: string;
+  center: string;
+  employee?: { empId: string; empType: string };
+}
+
+const sessionKey = 'canteenSession';
+type SessionStorage = Pick<DurableObjectStorage, 'get' | 'put' | 'delete'>;
+
+class CanteenSessionExpired extends Error {
+  constructor() {
+    super('订餐登录已失效，请重试。如果仍然失败，请在官方微信订餐入口重新登录。');
+  }
 }
 
 export class Canteen {
-  private token = '';
-  private center: string;
-  constructor(private env: Env) {
+  private auth?: CanteenSession;
+  private scope?: string;
+  private refreshAvailable = true;
+
+  constructor(
+    private env: Env,
+    private storage?: SessionStorage,
+  ) {}
+
+  private async authorize() {
+    const env = this.env;
     if (
       !/^\d{7}$/.test(env.CANTEEN_USER_NO || '') ||
-      !env.CANTEEN_PASSWORD ||
       !env.WECHAT_OPEN_ID ||
       !env.WECHAT_JSESSIONID
     ) {
       throw new Error('Configure the canteen account and WeChat session secrets before connecting');
     }
-    this.center = env.WECHAT_CENTER_ID || '9053';
+    const { result } = await this.send('/api/wechat/oauth', { openId: env.WECHAT_OPEN_ID }, 'POST');
+    const { token, centerId, empId, empType } = result ?? {};
+    if (typeof token !== 'string' || !token)
+      throw new Error('Canteen authentication did not return a token');
+    const session: CanteenSession = {
+      token,
+      center: String(centerId || env.WECHAT_CENTER_ID || '9053'),
+    };
+    if (empId != null && empType != null)
+      session.employee = { empId: String(empId), empType: String(empType) };
+    await this.storage?.put(sessionKey, { scope: this.scope, session });
+    this.auth = session;
+    return session;
   }
-  private headers(auth = false): Headers {
+
+  private headers(auth?: CanteenSession): Headers {
     const h = new Headers({
       'User-Agent': UA,
       Accept: 'application/json, text/plain, */*',
@@ -59,17 +76,16 @@ export class Canteen {
       Cookie: `JSESSIONID=${this.env.WECHAT_JSESSIONID}`,
     });
     if (auth) {
-      h.set('X-Access-Token', this.token);
-      h.set('CENTER_ID', this.center);
+      h.set('X-Access-Token', auth.token);
+      h.set('CENTER_ID', auth.center);
     }
     return h;
   }
-  private async request(
+  private async send(
     path: string,
     params: Record<string, string>,
-    method = 'POST',
-    auth = true,
-    body?: FormData,
+    method: string,
+    auth?: CanteenSession,
   ): Promise<Reply> {
     const url = new URL(path, ORIGIN);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
@@ -78,8 +94,8 @@ export class Canteen {
       headers: this.headers(auth),
       signal: AbortSignal.timeout(25_000),
     };
-    if (body) options.body = body;
     const r = await fetch(url, options);
+    if (r.status === 401) throw new CanteenSessionExpired();
     const text = await r.text();
     let payload: Reply;
     try {
@@ -87,44 +103,78 @@ export class Canteen {
     } catch {
       throw new Error(`Canteen ${path}: HTTP ${r.status}, invalid JSON`);
     }
-    // Full authentication responses are retained for debugging as requested by the operator.
-    if (path === '/api/wechat/oauth' || path === '/api/wechat/toBind')
-      console.log(`Canteen ${path} response`, payload);
-    if (!r.ok || !payload.success)
+    if (String(payload?.code) === '401') throw new CanteenSessionExpired();
+    if (!r.ok || !payload?.success)
       throw new Error(
-        payload.message || `Canteen ${path}: HTTP ${r.status}, code ${payload.code ?? 'unknown'}`,
+        payload?.message || `Canteen ${path}: HTTP ${r.status}, code ${payload?.code ?? 'unknown'}`,
       );
     return payload;
   }
+
   async session<T>(operation: (client: Canteen) => Promise<T>): Promise<T> {
-    const form = new FormData();
-    form.set('openId', this.env.WECHAT_OPEN_ID);
-    form.set(
-      'params',
-      await encryptedCredentials(this.env.CANTEEN_USER_NO, this.env.CANTEEN_PASSWORD),
-    );
-    await this.request('/api/wechat/toBind', {}, 'POST', false, form);
-    try {
-      const auth = await this.request(
-        '/api/wechat/oauth',
-        { openId: this.env.WECHAT_OPEN_ID },
-        'POST',
-        false,
-      );
-      this.token = auth.result?.token;
-      if (!this.token) throw new Error('Canteen authentication did not return a token');
-      this.center = String(auth.result?.centerId || this.center);
-      return await operation(this);
-    } finally {
-      if (this.token) {
-        try {
-          await this.request('/api/wechat/unBind', { userno: this.env.CANTEEN_USER_NO });
-        } catch (e) {
-          console.error('WeChat unbind failed', e);
-        }
-        this.token = '';
+    this.refreshAvailable = true;
+    if (this.storage && !this.auth) {
+      const env = this.env;
+      const identity = JSON.stringify([
+        env.CANTEEN_USER_NO,
+        env.WECHAT_OPEN_ID,
+        env.WECHAT_JSESSIONID,
+        env.WECHAT_CENTER_ID,
+      ]);
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identity));
+      this.scope = btoa(String.fromCharCode(...new Uint8Array(digest)));
+      const saved = await this.storage.get<{ scope: string; session: CanteenSession }>(sessionKey);
+      if (saved?.scope === this.scope) this.auth = saved.session;
+      else if (saved) await this.storage.delete(sessionKey);
+    }
+    if (!this.auth) await this.authorize();
+    return operation(this);
+  }
+
+  private async request(
+    path: string,
+    params: Record<string, string> | ((session: CanteenSession) => Record<string, string>),
+    method = 'POST',
+    retryOnExpiry = true,
+  ): Promise<Reply> {
+    while (true) {
+      let auth = this.auth;
+      if (!auth) {
+        if (!this.refreshAvailable) throw new CanteenSessionExpired();
+        this.refreshAvailable = false;
+        auth = await this.authorize();
+      }
+      try {
+        return await this.send(
+          path,
+          typeof params === 'function' ? params(auth) : params,
+          method,
+          auth,
+        );
+      } catch (e) {
+        if (!(e instanceof CanteenSessionExpired)) throw e;
+        this.auth = undefined;
+        await this.storage?.delete(sessionKey);
+        if (!retryOnExpiry || !this.refreshAvailable) throw e;
+        console.info('Canteen rejected the cached OAuth token. Refreshing the session.');
       }
     }
+  }
+
+  async balance(): Promise<number> {
+    const { result } = await this.request('/api/wechat/getUserInfo', ({ employee }) => {
+      if (!employee?.empId || !employee.empType) throw new Error('订餐系统未返回账户信息');
+      return employee;
+    });
+    const value: unknown = result?.eaccountvalue;
+    const balance =
+      typeof value === 'number'
+        ? value
+        : typeof value === 'string' && /^-?\d+(?:\.\d+)?$/.test(value.trim())
+          ? Number(value)
+          : NaN;
+    if (!Number.isFinite(balance)) throw new Error('订餐系统未返回有效余额');
+    return balance;
   }
   async menu(date: string): Promise<MealMap> {
     const data =
@@ -158,7 +208,7 @@ export class Canteen {
     ).result;
     return Array.isArray(result) ? result : [];
   }
-  async details(start: string, end: string, budget?: OrderHistoryBudget): Promise<Detail[]> {
+  async details(start: string, end: string, budget?: RequestBudget): Promise<Detail[]> {
     const rows: Detail[] = [];
     for (let page = 1; page <= 30; page++) {
       const result =
@@ -177,17 +227,19 @@ export class Canteen {
       rows.push(...batch);
       if (!batch.length || page >= Number(result.pages || 1)) return rows;
       if (budget) {
-        if (!budget.extraPages) throw new Error('订餐记录页数过多，无法确认订单');
-        budget.extraPages--;
+        if (!budget.remaining) throw new Error('订餐记录页数过多，无法确认订单');
+        budget.remaining--;
       }
     }
     throw new Error('Order history exceeds the page limit; narrow the date range');
   }
   async cancel(id: string) {
-    return this.request('/api/orderdata/cancelOrderDetail', {
-      userno: this.env.CANTEEN_USER_NO,
-      orderid: id,
-    });
+    return this.request(
+      '/api/orderdata/cancelOrderDetail',
+      { userno: this.env.CANTEEN_USER_NO, orderid: id },
+      'POST',
+      false,
+    );
   }
   async order(entries: { date: string; meal: number; dish: Dish }[]) {
     if (!entries.length) return;
@@ -197,6 +249,11 @@ export class Canteen {
       .map((e) => `${e.date}~${e.meal}~${e.dish.id}~1~'`)
       .join(',')
       .replaceAll("'", '%27');
-    await this.request('/api/orderdata/setOrder', { userno: this.env.CANTEEN_USER_NO, data });
+    await this.request(
+      '/api/orderdata/setOrder',
+      { userno: this.env.CANTEEN_USER_NO, data },
+      'POST',
+      false,
+    );
   }
 }

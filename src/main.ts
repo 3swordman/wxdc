@@ -2,7 +2,9 @@ import './style.css';
 import { groupDishesByCategory } from '../worker/categories';
 import {
   MEALS,
+  bookedMealsRange,
   emptyMeals,
+  nowShanghai,
   type AIOrderResult,
   type MealMap,
   type OrderDay,
@@ -19,7 +21,6 @@ const esc = (s: unknown) =>
     /[&<>"']/g,
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!,
   );
-const today = () => new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 10);
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body) headers.set('Content-Type', 'application/json');
@@ -33,7 +34,7 @@ function report(e: unknown) {
   alert(e instanceof Error ? e.message : String(e));
 }
 function shell(content: string, current = '') {
-  app.innerHTML = `<div class="min-h-screen"><header class="border-b border-base-300 bg-base-100"><div class="mx-auto max-w-6xl px-5 py-4 sm:flex sm:items-center sm:justify-between"><a href="#home" class="text-xl font-bold tracking-tight">WXDC <span class="text-sm font-normal text-base-content/60">订餐助手</span></a><nav class="mt-3 flex flex-wrap gap-2 sm:mt-0"><a class="btn btn-sm ${current === 'home' ? 'btn-active' : 'btn-ghost'}" href="#home">首页</a><a class="btn btn-sm ${current === 'settings' ? 'btn-active' : 'btn-ghost'}" href="#settings">订餐设置</a><a class="btn btn-sm ${current === 'live' ? 'btn-active' : 'btn-ghost'}" href="#live">每日订单</a><button id="logout" class="btn btn-sm btn-ghost">退出</button></nav></div></header><main class="mx-auto max-w-6xl px-5 py-8">${content}</main></div>`;
+  app.innerHTML = `<div class="min-h-screen"><header class="border-b border-base-300 bg-base-100"><div class="mx-auto max-w-6xl px-5 py-4 sm:flex sm:items-center sm:justify-between"><a href="#home" class="text-xl font-bold tracking-tight">WXDC <span class="text-sm font-normal text-base-content/60">订餐助手</span></a><nav class="mt-3 flex flex-wrap gap-2 sm:mt-0"><a class="btn btn-sm ${current === 'home' ? 'btn-active' : 'btn-ghost'}" href="#home">首页</a><a class="btn btn-sm ${current === 'settings' ? 'btn-active' : 'btn-ghost'}" href="#settings">订餐设置</a><a class="btn btn-sm ${current === 'live' ? 'btn-active' : 'btn-ghost'}" href="#live">每日订单</a><a class="btn btn-sm ${current === 'booked' ? 'btn-active' : 'btn-ghost'}" href="#booked"${current === 'booked' ? ' aria-current="page"' : ''}>已订餐品</a><button id="logout" class="btn btn-sm btn-ghost">退出</button></nav></div></header><main class="mx-auto max-w-6xl px-5 py-8">${content}</main></div>`;
   document.querySelector('#logout')?.addEventListener('click', async () => {
     try {
       await api('/api/logout', { method: 'POST' });
@@ -53,8 +54,8 @@ function login() {
         method: 'POST',
         body: JSON.stringify({ password: new FormData(form).get('password') }),
       });
-      location.hash = 'home';
-      await home();
+      if (location.hash === '#home') await home();
+      else location.hash = 'home';
     } catch (err) {
       document.querySelector('#login-error')!.textContent =
         err instanceof Error ? err.message : String(err);
@@ -70,10 +71,24 @@ async function home(result?: AIOrderResult) {
   shell(
     `<div class="mb-8 sm:flex sm:items-end sm:justify-between"><div><p class="text-sm font-medium text-base-content/60">YOUR MEAL PLANNER</p><h1 class="mt-1 text-3xl font-bold">今天吃什么？</h1><p class="mt-2 text-base-content/70">管理订餐偏好，查看菜单并确认订单。</p></div><div class="mt-4 flex flex-wrap gap-2 sm:mt-0"><button id="ai-order" type="button" class="btn btn-primary">AI 立即订餐</button><a href="#settings" class="btn">设置订餐偏好 →</a></div></div>
   <div id="ai-order-status" role="status" class="alert mb-5 sm:alert-horizontal" hidden><span></span></div>
-  <div class="grid gap-4 md:grid-cols-3"><section class="card card-border bg-base-100"><div class="card-body"><p class="text-sm text-base-content/60">定时生成</p><h2 class="text-xl font-semibold">${settings.scheduleEnabled ? '已开启' : '未开启'}</h2><p class="text-sm text-base-content/60">${scheduleHours}</p></div></section><section class="card card-border bg-base-100"><div class="card-body"><p class="text-sm text-base-content/60">自动提交</p><h2 class="text-xl font-semibold">${settings.autoSubmit ? '已开启' : '未开启'}</h2><p class="text-sm text-base-content/60">${settings.autoSubmit ? '定时生成后将提交订单' : '生成后由你手动确认'}</p></div></section><section class="card card-border bg-base-100"><div class="card-body"><p class="text-sm text-base-content/60">待确认订单</p><h2 class="text-xl font-semibold">${orders.length} 份</h2><p class="text-sm text-base-content/60">已保存的周订单</p></div></section></div>
+  <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+    <section class="card card-border bg-base-100"><div class="card-body"><h2 class="text-sm text-base-content/60">当前余额</h2><p id="current-balance" class="text-xl font-semibold tabular-nums" role="status">正在查询…</p></div></section>
+    <section class="card card-border bg-base-100"><div class="card-body"><p class="text-sm text-base-content/60">定时生成</p><h2 class="text-xl font-semibold">${settings.scheduleEnabled ? '已开启' : '未开启'}</h2><p class="text-sm text-base-content/60">${scheduleHours}</p></div></section><section class="card card-border bg-base-100"><div class="card-body"><p class="text-sm text-base-content/60">自动提交</p><h2 class="text-xl font-semibold">${settings.autoSubmit ? '已开启' : '未开启'}</h2><p class="text-sm text-base-content/60">${settings.autoSubmit ? '定时生成后将提交订单' : '生成后由你手动确认'}</p></div></section><section class="card card-border bg-base-100"><div class="card-body"><p class="text-sm text-base-content/60">待确认订单</p><h2 class="text-xl font-semibold">${orders.length} 份</h2><p class="text-sm text-base-content/60">已保存的周订单</p></div></section></div>
   <section class="mt-8 card card-border bg-base-100"><div class="card-body"><div class="sm:flex sm:items-center sm:justify-between"><div><h2 class="card-title">待提交订单</h2><p class="mt-1 text-sm text-base-content/60">选择日期，核对菜品并提交。</p></div><div class="mt-4 flex gap-2 sm:mt-0"><button id="generate-current" class="btn btn-sm">生成本周</button><button id="generate-next" class="btn btn-sm">生成下周</button></div></div><div class="mt-4 divide-y divide-base-300">${orders.length ? orders.map((o) => `<a href="#order/${esc(o.week_start)}" class="flex items-center justify-between py-4 hover:opacity-70"><span><strong>${esc(o.week_start)}</strong><span class="ml-2 text-sm text-base-content/60">周订单</span></span><span>查看 →</span></a>`).join('') : '<p class="py-5 text-sm text-base-content/60">暂无待提交订单。请先设置订餐日期，再生成订单。</p>'}</div></div></section>
   <section class="mt-6 card card-border bg-base-100"><div class="card-body"><h2 class="card-title">最近活动</h2>${jobs.length ? jobs.map((j) => `<div class="flex justify-between gap-4 border-b border-base-200 py-2 text-sm"><span>${esc(j.message)}</span><span class="shrink-0 text-base-content/60">${esc(j.status)}</span></div>`).join('') : '<p class="text-sm text-base-content/60">暂无活动记录</p>'}</div></section>`,
     'home',
+  );
+  const balanceValue = document.querySelector('#current-balance')!;
+  void api<{ balance: number }>('/api/balance').then(
+    ({ balance }) => {
+      balanceValue.textContent = new Intl.NumberFormat('zh-CN', {
+        style: 'currency',
+        currency: 'CNY',
+      }).format(balance);
+    },
+    () => {
+      balanceValue.textContent = '暂无法读取';
+    },
   );
   const aiButton = document.querySelector<HTMLButtonElement>('#ai-order')!;
   const aiStatus = document.querySelector<HTMLDivElement>('#ai-order-status')!;
@@ -251,33 +266,67 @@ async function orderPage(week: string) {
     }
   });
 }
-async function livePage(date = today()) {
+async function bookedMealsPage() {
+  const { start, end } = bookedMealsRange();
   shell(
-    `<div class="mb-7"><a href="#home" class="text-sm text-base-content/60">← 返回首页</a><h1 class="mt-3 text-3xl font-bold">每日菜单与订单</h1><p class="mt-2 text-base-content/70">查看并调整已经提交的餐品。</p></div><section class="card card-border bg-base-100"><div class="card-body"><form id="date-form" class="flex flex-wrap items-end gap-3"><label><span class="mb-2 block text-sm font-medium">选择日期</span><input type="date" name="date" class="input" value="${esc(date)}" required></label><button class="btn" type="submit">查看</button></form><div id="live-content" class="mt-5 text-base-content/60">正在加载…</div></div></section><section class="card card-border bg-base-100 mt-5"><div class="card-body"><h2 class="card-title">按日期查询已订餐品</h2><form id="range-form" class="flex flex-wrap items-end gap-3"><label><span class="mb-2 block text-sm font-medium">开始日期</span><input type="date" name="start" class="input" value="${esc(date)}" required></label><label><span class="mb-2 block text-sm font-medium">结束日期</span><input type="date" name="end" class="input" value="${esc(date)}" required></label><button class="btn" type="submit">查询订单</button></form><div id="range-result" class="mt-4"></div></div></section>`,
-    'live',
+    `<h1 class="mb-7 text-3xl font-bold">已订餐品</h1>
+    <section class="card card-border bg-base-100"><div class="card-body">
+      <form id="range-form" class="flex flex-wrap items-end gap-3">
+        <label><span class="mb-2 block text-sm font-medium">开始日期</span><input type="date" name="start" class="input" value="${start}" required></label>
+        <label><span class="mb-2 block text-sm font-medium">结束日期</span><input type="date" name="end" class="input" value="${end}" required></label>
+        <button class="btn" type="submit">查询订单</button>
+      </form>
+      <div id="range-result" class="mt-4" aria-live="polite"></div>
+    </div></section>`,
+    'booked',
   );
-  document.querySelector<HTMLFormElement>('#range-form')!.onsubmit = async (e) => {
-    e.preventDefault();
-    const fd = new FormData(e.currentTarget as HTMLFormElement);
-    const target = document.querySelector('#range-result')!;
+  const form = document.querySelector<HTMLFormElement>('#range-form')!;
+  const target = document.querySelector('#range-result')!;
+  const button = form.querySelector<HTMLButtonElement>('button')!;
+  const loadOrders = async () => {
+    if (button.disabled) return;
+    const fields = new FormData(form);
+    const query = new URLSearchParams({
+      start: String(fields.get('start')),
+      end: String(fields.get('end')),
+    });
+    button.disabled = true;
+    target.textContent = '正在加载…';
     try {
-      const out = await api<{
+      const { details } = await api<{
         details: { ORDERDATE: string; ORDERTYPE: string | number; DISHESNAME: string }[];
-      }>(
-        `/api/overview?start=${encodeURIComponent(String(fd.get('start')))}&end=${encodeURIComponent(String(fd.get('end')))}`,
-      );
-      target.innerHTML = out.details.length
-        ? out.details
+      }>(`/api/overview?${query}`);
+      target.innerHTML = details.length
+        ? `<div class="overflow-x-auto"><table class="table">
+          <thead><tr><th scope="col">日期</th><th scope="col">餐次</th><th scope="col">餐品</th></tr></thead>
+          <tbody>${details
+            .sort(
+              (a, b) =>
+                a.ORDERDATE.localeCompare(b.ORDERDATE) || Number(a.ORDERTYPE) - Number(b.ORDERTYPE),
+            )
             .map(
               (x) =>
-                `<p class="border-b border-base-200 py-2">${esc(x.ORDERDATE)} · ${esc(labels[Number(x.ORDERTYPE)] || '其他')} · ${esc(x.DISHESNAME)}</p>`,
+                `<tr><td class="whitespace-nowrap">${esc(x.ORDERDATE)}</td><td class="whitespace-nowrap">${esc(labels[Number(x.ORDERTYPE)] || '其他')}</td><td>${esc(x.DISHESNAME)}</td></tr>`,
             )
-            .join('')
+            .join('')}</tbody></table></div>`
         : '<p class="text-base-content/60">该日期范围内暂无订单。</p>';
     } catch (err) {
-      report(err);
+      target.innerHTML = `<div class="alert alert-error"><span>${esc(err instanceof Error ? err.message : err)}</span></div>`;
+    } finally {
+      button.disabled = false;
     }
   };
+  form.onsubmit = (e) => {
+    e.preventDefault();
+    void loadOrders();
+  };
+  await loadOrders();
+}
+async function livePage(date = nowShanghai()) {
+  shell(
+    `<div class="mb-7"><a href="#home" class="text-sm text-base-content/60">← 返回首页</a><h1 class="mt-3 text-3xl font-bold">每日菜单与订单</h1><p class="mt-2 text-base-content/70">查看并调整已经提交的餐品。</p></div><section class="card card-border bg-base-100"><div class="card-body"><form id="date-form" class="flex flex-wrap items-end gap-3"><label><span class="mb-2 block text-sm font-medium">选择日期</span><input type="date" name="date" class="input" value="${esc(date)}" required></label><button class="btn" type="submit">查看</button></form><div id="live-content" class="mt-5 text-base-content/60">正在加载…</div></div></section>`,
+    'live',
+  );
   document.querySelector<HTMLFormElement>('#date-form')!.onsubmit = (e) => {
     e.preventDefault();
     const date = new FormData(e.currentTarget as HTMLFormElement).get('date');
@@ -323,7 +372,8 @@ async function route() {
     const [page, arg] = location.hash.slice(1).split('/');
     if (page === 'settings') await settingsPage();
     else if (page === 'order' && arg) await orderPage(arg);
-    else if (page === 'live') await livePage(arg || today());
+    else if (page === 'booked') await bookedMealsPage();
+    else if (page === 'live') await livePage(arg || nowShanghai());
     else await home();
   } catch (e) {
     if (e instanceof Error && e.message === '请先登录') login();
