@@ -38,7 +38,7 @@ Open the address printed by Vite, sign in with `APP_PASSWORD`, and configure you
 3. Ensure `.dev.vars` contains your real values, then build and upload the Worker and those secrets together:
 
    ```bash
-   pnpm run deploy:local --secrets-file .dev.vars
+   pnpm run deploy --secrets-file .dev.vars
    ```
 
    This command deploys the application. `.dev.vars` remains a local file and must not be committed or shared. `WECHAT_CENTER_ID` may be omitted to use `9053`.
