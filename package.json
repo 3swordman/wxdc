@@ -10,8 +10,9 @@
     "preview": "vite preview",
     "test": "vitest run",
     "db:local": "wrangler d1 migrations apply wxdc --local",
-    "db:remote": "wrangler d1 migrations apply wxdc --remote",
-    "deploy": "pnpm run build && wrangler deploy",
+    "db:remote": "wrangler d1 migrations apply DB --remote --config wrangler.deploy.jsonc",
+    "deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy",
+    "deploy:local": "pnpm run build --mode deploy && wrangler deploy",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint --deny-warnings .",
     "lint:fix": "oxlint --fix .",
@@ -40,5 +41,30 @@
   "engines": {
     "node": ">=22.13.0"
   },
-  "packageManager": "pnpm@10.34.8"
+  "packageManager": "pnpm@10.34.8",
+  "cloudflare": {
+    "bindings": {
+      "APP_PASSWORD": {
+        "description": "Choose a unique WXDC sign-in password of at least 12 characters."
+      },
+      "SESSION_SECRET": {
+        "description": "Generate a random signing secret with `openssl rand -hex 32`."
+      },
+      "CANTEEN_USER_NO": {
+        "description": "Enter your own canteen student number."
+      },
+      "WECHAT_OPEN_ID": {
+        "description": "Use the OpenID of your WeChat account already bound in the official canteen portal."
+      },
+      "WECHAT_JSESSIONID": {
+        "description": "Use a current JSESSIONID cookie from your own signed-in canteen session."
+      },
+      "WECHAT_CENTER_ID": {
+        "description": "Use the default center ID of `9053`."
+      },
+      "DEEPSEEK_API_KEY": {
+        "description": "Create an API key in your own [DeepSeek account](https://platform.deepseek.com/api_keys)."
+      }
+    }
+  }
 }

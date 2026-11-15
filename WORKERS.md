@@ -24,15 +24,21 @@ pnpm run dev
 
 Open the address printed by Vite, sign in with `APP_PASSWORD`, and configure your meal schedule and preferences. The local database is separate from the deployed D1 database. Both scheduled generation and automatic submission start disabled. Manual generation contacts the live canteen and DeepSeek APIs; submitting or editing orders changes real orders.
 
-## Deployment
+## Deploy with Cloudflare
 
-1. Run `pnpm exec wrangler login`, then `pnpm exec wrangler d1 create wxdc`. Put the returned database ID in `wrangler.jsonc`.
+1. Click **Deploy to Cloudflare** in the [README](README.md) and connect your GitHub account. Cloudflare creates a repository and provisions a D1 database for your Worker.
+2. Add your own values in the secrets form. Choose a unique app password and generate a signing secret with `openssl rand -hex 32`. Use your own bound canteen account and DeepSeek API key.
+3. Use `pnpm run build` as the build command and `pnpm run deploy` as the deploy command. The deploy command applies D1 migrations before uploading the Worker. If the migration step reports a permission error, give your Workers Builds API token **Account → D1 → Edit** for the account hosting the database.
+4. Open the Worker’s `workers.dev` URL in the Cloudflare dashboard. Sign in with `APP_PASSWORD` and verify that the balance and menu load. If the canteen session expires, update `WECHAT_JSESSIONID` under **Settings → Variables and Secrets** with a current session cookie from your own account.
+
+## Deploy from the CLI
+
+1. Run `pnpm exec wrangler login` and copy `wrangler.jsonc` to `wrangler.deploy.jsonc`. Use `pnpm exec wrangler d1 list` to find your existing `wxdc` database UUID, or run `pnpm exec wrangler d1 create wxdc` for a new installation. Put the UUID in `wrangler.deploy.jsonc`, which Git ignores and Vite reads when building for deployment.
 2. Apply the database schema with `pnpm run db:remote`.
 3. Ensure `.dev.vars` contains your real values, then build and upload the Worker and those secrets together:
 
    ```bash
-   pnpm run build
-   pnpm exec wrangler deploy --secrets-file .dev.vars
+   pnpm run deploy:local --secrets-file .dev.vars
    ```
 
    This command deploys the application. `.dev.vars` remains a local file and must not be committed or shared. `WECHAT_CENTER_ID` may be omitted to use `9053`.

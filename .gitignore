@@ -17,6 +17,7 @@ coverage/
 .DS_Store
 Thumbs.db
 .wrangler/
+wrangler.deploy.jsonc
 .dev.vars
 .dev.vars.*
 !.dev.vars.example

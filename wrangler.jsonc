@@ -3,7 +3,7 @@
   "name": "wxdc",
   "main": "worker/index.ts",
   "compatibility_date": "2026-11-13",
-  "workers_dev": false,
+  "workers_dev": true,
   "preview_urls": false,
   "assets": {
     "binding": "ASSETS",
